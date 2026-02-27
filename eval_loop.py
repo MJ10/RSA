@@ -6,10 +6,11 @@ import argparse, json, math, os, re
 from typing import List, Optional, Callable
 import pandas as pd
 from rewards.math import last_boxed_only_string, remove_boxed, is_equiv
+from rewards.arxiv_math import parse_answer, extract_answer, check_answers
 import numpy as np
 import random
 from reasoning_gym.factory import get_score_answer_fn
-from datasets import Dataset
+from datasets import Dataset, load_dataset
 from tqdm import tqdm
 import pickle
 from pathlib import Path
@@ -74,6 +75,42 @@ def _append_metrics_to_json(path: str, entry: dict):
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
 
+def _debug_candidate_stats(data: List[dict], tag: str, max_examples: int = 3) -> None:
+    """Print candidate-count diagnostics for quick checkpoint sanity checks."""
+    counts: List[int] = []
+    for row in data:
+        cands = row.get("candidates")
+        if isinstance(cands, list):
+            counts.append(len(cands))
+        elif cands is None:
+            counts.append(0)
+        else:
+            counts.append(-1)
+
+    if not counts:
+        print(f"[DEBUG] {tag}: no rows")
+        return
+
+    unique_counts = sorted(set(counts))
+    unique_preview = unique_counts[:10]
+    suffix = " ..." if len(unique_counts) > 10 else ""
+    avg_count = sum(counts) / max(1, len(counts))
+    print(
+        f"[DEBUG] {tag}: rows={len(data)} "
+        f"candidate_count[min/avg/max]={min(counts)}/{avg_count:.2f}/{max(counts)} "
+        f"unique={unique_preview}{suffix}"
+    )
+
+    for idx, row in enumerate(data[:max_examples]):
+        cands = row.get("candidates")
+        cand_len = len(cands) if isinstance(cands, list) else 0
+        first_type = type(cands[0]).__name__ if isinstance(cands, list) and cands else "None"
+        nested_len = len(cands[0]) if isinstance(cands, list) and cands and isinstance(cands[0], list) else None
+        print(
+            f"[DEBUG] {tag}: row={idx} candidate_len={cand_len} "
+            f"first_type={first_type} nested_len={nested_len}"
+        )
+
 
 def extract_question_from_prompt(prompt_cell: Any) -> str:
     """
@@ -109,14 +146,18 @@ def extract_rg_solution(completion: str) -> Optional[str]:
 
 # make sure to include all the possible data sources in the if-else
 def get_task_name(ds: Dataset) -> str:
-    data_source = ds[0]['data_source']
-    if "aime" in data_source or "hmmt" in data_source or "MATH" in data_source or "DeepScaleR" in data_source:
+    data_source = str(ds[0]['data_source'])
+    data_source_lower = data_source.lower()
+
+    if "arxiv_math" in data_source_lower or "arxivmath" in data_source_lower:
+        return "arxiv_math"
+    if "aime" in data_source_lower or "hmmt" in data_source_lower or "math" in data_source_lower or "deepscaler" in data_source_lower:
         return "math"
-    elif "reasoning_gym" in data_source:
+    elif "reasoning_gym" in data_source_lower:
         return "rg"
-    elif "m-a-p/SuperGPQA" in data_source:
+    elif "m-a-p/supergpqa" in data_source_lower:
         return 'supergpqa'
-    elif data_source == 'lcb':
+    elif data_source_lower == 'lcb':
         return 'code'
     else:
         raise ValueError(f"Unknown task: {data_source}")
@@ -143,12 +184,17 @@ def render_chat_template_gpt(tokenizer: AutoTokenizer, prompt: str, reasoning) -
 
 
 def aggregate_prompt(question: str, candidate_answers: List[str], task: str) -> str:
+    arxiv_loop_guidance = ""
     if task == 'rg':
         problem_kind = 'problem'
         format_hint = '<answer>...</answer>'
     elif task == 'supergpqa':
         problem_kind = 'multiple-choice problem'
         format_hint = '\\boxed{}. Only include the correct option letter in \\boxed{}; for example \\boxed{A}'
+    elif task == 'arxiv_math':
+        problem_kind = 'math problem'
+        format_hint = '\\boxed{}'
+        arxiv_loop_guidance = " Focus on producing the final answer and follow any additional formatting instructions in the question."
     else:
         problem_kind = 'math problem'
         format_hint = '\\boxed{}'
@@ -160,7 +206,8 @@ def aggregate_prompt(question: str, candidate_answers: List[str], task: str) -> 
             "The candidate may be incomplete or contain errors. "
             "Refine this trajectory and produce an improved, higher-quality solution. "
             "If it is entirely wrong, attempt a new strategy. "
-            f"End with the final result in {format_hint}.\n"
+            f"End with the final result in {format_hint}."
+            f"{arxiv_loop_guidance}\n"
         )
     else:
         parts.append(
@@ -168,7 +215,8 @@ def aggregate_prompt(question: str, candidate_answers: List[str], task: str) -> 
             "Some candidates may be incorrect or contain errors. "
             "Aggregate the useful ideas and produce a single, high-quality solution. "
             "Reason carefully; if candidates disagree, choose the correct path. If all are incorrect, then attempt a different strategy."
-            f"End with the final result in {format_hint}.\n"
+            f"End with the final result in {format_hint}."
+            f"{arxiv_loop_guidance}\n"
         )
 
     parts.append("Problem:\n")
@@ -197,7 +245,20 @@ def build_prompt(tokenizer: AutoTokenizer, question: str, candidate_answers: Opt
     if candidate_answers is not None:
         prompt = aggregate_prompt(question, candidate_answers, task)
     else:
-        prompt = question
+        if task == 'arxiv_math':
+            prompt = "\n".join(
+                [
+                    "You are given a difficult question. Your task is to solve the problem.",
+                    "The question is written in such a way that it solely requires you to find the final answer. "
+                    "Make sure to follow the additional formatting instructions if they are provided in the question.",
+                    "Put the final answer you find within \\boxed{}.",
+                    "",
+                    "Problem:",
+                    question.strip(),
+                ]
+            )
+        else:
+            prompt = question
     return chat_template_fn(tokenizer, prompt)
 
 
@@ -277,7 +338,8 @@ def summarize_candidates_inplace(
             max_tokens=max_tokens
         )
     if prompt_token_ids:
-        outs = llm.generate(prompt_token_ids=requests, sampling_params=summarize_params)
+        token_prompts = [{"prompt_token_ids": ids} for ids in requests]
+        outs = llm.generate(token_prompts, sampling_params=summarize_params)
     else:
         outs = llm.generate(requests, sampling_params=summarize_params)
     flat = [o.text for out in outs for o in out.outputs]
@@ -293,7 +355,7 @@ def verify_candidates(
     tokenizer: AutoTokenizer,
     data: List[dict],
     chat_template_fn: Callable[[AutoTokenizer, str], List],
-    prompt_token_ids: bool = False,    
+    prompt_token_ids: bool = False,
 ) -> None:
     """
     For each problem, verify each candidate individually and compute mean accuracy among True candidates. If all are False, compute mean acc.
@@ -321,7 +383,8 @@ def verify_candidates(
             stop_token_ids=stop_token_ids
         )
         print(tokenizer.decode(requests[0]))
-        outs = llm.generate(prompt_token_ids=requests, sampling_params=summarize_params)
+        token_prompts = [{"prompt_token_ids": ids} for ids in requests]
+        outs = llm.generate(token_prompts, sampling_params=summarize_params)
     else:
         summarize_params = SamplingParams(
             n=1,
@@ -371,6 +434,46 @@ def evaluate_k_answers_math(k_answers: List[str], gt: str) -> Dict[str, Any]:
 
     best = max(clusters, key=lambda c: c["count"])
     majority_vote = float(bool(is_equiv(best["rep"], gt)))
+
+    return {
+        "pred_accuracies": [float(b) for b in correct_bools],
+        "mean_acc": mean_acc,
+        "pass_at_k": pass_at_k,
+        "majority_vote_correct": majority_vote
+    }
+
+
+def evaluate_k_answers_arxiv_math(k_answers: List[str], gt: str) -> Dict[str, Any]:
+    parsed_gt = parse_answer(str(gt))[0]
+    parsed_answers: List[Any] = []
+    correct_bools: List[bool] = []
+    for model_reply in k_answers:
+        parsed_reply = extract_answer(model_reply)[0]
+        parsed_answers.append(parsed_reply)
+        correct = check_answers(parsed_gt, parsed_reply)
+        correct_bools.append(bool(correct))
+
+    ## mean accuracy, pass@k
+    mean_acc = float(sum(correct_bools) / max(1, len(correct_bools)))
+    pass_at_k = float(1.0 if any(correct_bools) else 0.0)
+
+    ## majority vote
+    clusters: List[Dict[str, Any]] = []
+    for ans in parsed_answers:
+        placed = False
+        for c in clusters:
+            if bool(check_answers(ans, c["rep"])):
+                c["count"] += 1
+                placed = True
+                break
+        if not placed:
+            clusters.append({"rep": ans, "count": 1})
+
+    if not clusters:
+        majority_vote = 0.0
+    else:
+        best = max(clusters, key=lambda c: c["count"])
+        majority_vote = float(bool(check_answers(best["rep"], parsed_gt)))
 
     return {
         "pred_accuracies": [float(b) for b in correct_bools],
@@ -449,6 +552,7 @@ def run(
 ):
 
     requests, ground_truths, dataset_names = [], [], []
+    print(f"[DEBUG] run start: problems={len(data)} k={k} population={population}")
     for problem in data:
         prompt = problem['orig_prompt']
         ground_truth = problem['gt']
@@ -458,15 +562,17 @@ def run(
         for candidates in candidate_answers:
             request = build_prompt(tokenizer, prompt, candidates, task, chat_template_fn=chat_template_fn)
             requests.append(request)
-    
+
     if prompt_token_ids:
         print(tokenizer.decode(requests[0]))
-        outs = llm.generate(prompt_token_ids=requests, sampling_params=sampling)
+        token_prompts = [{"prompt_token_ids": ids} for ids in requests]
+        outs = llm.generate(token_prompts, sampling_params=sampling)
     else:
         print(requests[0])
         outs = llm.generate(requests, sampling_params=sampling)
     all_responses = [o.text for out in outs for o in out.outputs]
     print(all_responses[0])
+    print(f"[DEBUG] run outputs: expected={len(data) * population} got={len(all_responses)}")
 
     response_length = [len(tokenizer.encode(response)) for response in all_responses]
     median = np.percentile(response_length, 50)
@@ -478,11 +584,12 @@ def run(
 
     for problem, responses in zip(data, all_responses):
         problem['candidates'] = responses
+    _debug_candidate_stats(data, "after_run_assignment")
 
     if self_verify:
         verified_vals = verify_candidates(
-                llm, 
-                tokenizer, 
+                llm,
+                tokenizer,
                 data,
                 chat_template_fn=chat_template_fn,
                 prompt_token_ids=prompt_token_ids
@@ -500,6 +607,8 @@ def run(
         if task == 'rg':
             score_answer_fn = get_score_answer_fn(name=dataset_name)
             perf_metric = evaluate_k_answers_rg(score_answer_fn, responses[:], gt)
+        elif task == 'arxiv_math':
+            perf_metric = evaluate_k_answers_arxiv_math(responses[:], gt)
         else:
             perf_metric = evaluate_k_answers_math(responses[:], gt) # Also works for supergpqa
         mean_acc.append(perf_metric['mean_acc'])
@@ -523,7 +632,6 @@ def run(
             verified_score = sum([x*y for x,y in zip(scores, verified)]) / max(1, sum(verified))
             verified_score_list.append(verified_score)
 
-    
     metrics = json.dumps(
         {
             "n_samples": len(mean_acc),
@@ -575,7 +683,10 @@ def loop(
         sampling = SamplingParams(
             n=1, temperature=temperature, max_tokens=max_new_tokens
         )
-    ds = Dataset.from_parquet(seed_dataset)
+    if seed_dataset == 'arxiv_math':
+        ds = load_dataset("MathArena/arxivmath", split="train")
+    else:
+        ds = Dataset.from_parquet(seed_dataset)
 
     if 'gpt' in model_name:
         if reasoning == 'low':
@@ -593,7 +704,7 @@ def loop(
 
     # Prepare scorer for RG when needed
     score_answer_fn: Optional[Callable[[str, str], float]] = None
-    task = get_task_name(ds)
+    task = "arxiv_math" if seed_dataset == "arxiv_math" else get_task_name(ds)
 
     # control RNG for candidate sampling too
     random.seed(seed)
@@ -601,30 +712,26 @@ def loop(
 
     os.makedirs(output_dir, exist_ok=True)
     metrics_path = os.path.join(output_dir, 'k_'+str(k)+'_N_'+str(population)+'_seed_'+str(seed)+'.json')
+
     if not resume:
         if os.path.exists(metrics_path):
             os.remove(metrics_path)
     checkpoints_path = os.path.join(output_dir, 'checkpoints/' + 'k_'+str(k)+'_N_'+str(population)+'_seed_'+str(seed))
     os.makedirs(checkpoints_path, exist_ok=True)
 
-    if resume:
-        try:
-            data, start_loop_idx, _ = load_latest_loop_file(checkpoints_path)
-            print(f'Starting Inference from Loop: {start_loop_idx + 1}')
-        except:
-            print(f'Checkpoint not found; defaulting to base')
-            data = [
+    def build_initial_data() -> List[Dict[str, Any]]:
+        if task == 'arxiv_math':
+            return [
                 {
-                    'orig_prompt': extract_question_from_prompt(row['prompt']),
-                    'dataset_name': (row['extra_info']['dataset_name'] if task == 'rg' else None),
-                    'gt': (json.loads(row['extra_info']['entry']) if task == 'rg' else row['reward_model']['ground_truth']),
+                    'orig_prompt': row['problem'],
+                    'dataset_name': 'arxiv_math',
+                    'gt': row['answer'],
                     'candidates': None,
                 }
                 for row in ds
             ]
-            start_loop_idx = -1
-    else:
-        data = [
+
+        return [
             {
                 'orig_prompt': extract_question_from_prompt(row['prompt']),
                 'dataset_name': (row['extra_info']['dataset_name'] if task == 'rg' else None),
@@ -633,6 +740,18 @@ def loop(
             }
             for row in ds
         ]
+
+    if resume:
+        try:
+            data, start_loop_idx, _ = load_latest_loop_file(checkpoints_path)
+            print(f'Starting Inference from Loop: {start_loop_idx + 1}')
+            _debug_candidate_stats(data, "loaded_checkpoint")
+        except:
+            print(f'Checkpoint not found; defaulting to base')
+            data = build_initial_data()
+            start_loop_idx = -1
+    else:
+        data = build_initial_data()
         start_loop_idx = -1
 
     for loop_idx in range(start_loop_idx + 1, loops):
@@ -649,8 +768,16 @@ def loop(
             chat_template_fn=chat_template_fn,
             prompt_token_ids=True if 'gpt' in model_name else False
         )
-        with open(os.path.join(checkpoints_path,f'loop_{loop_idx}.pkl'), 'wb') as file:
+        checkpoint_file = os.path.join(checkpoints_path, f'loop_{loop_idx}.pkl')
+        _debug_candidate_stats(data, f"pre_save_loop_{loop_idx}")
+        with open(checkpoint_file, 'wb') as file:
             pickle.dump(data, file)
+        try:
+            with open(checkpoint_file, "rb") as file:
+                reloaded_data = pickle.load(file)
+            _debug_candidate_stats(reloaded_data, f"post_save_reload_loop_{loop_idx}")
+        except Exception as e:
+            print(f"[DEBUG] checkpoint reload failed at loop {loop_idx}: {e}")
 
         print(loop_idx, metrics)
         if summarize_cot and loop_idx < loops - 1:
@@ -658,7 +785,7 @@ def loop(
             summarize_candidates_inplace(
                 llm=llm,
                 tokenizer=tokenizer,
-                data=base_structure,
+                data=data,
                 max_tokens=max_new_tokens,
                 temperature=temperature,
                 chat_template_fn=chat_template_fn,
@@ -684,7 +811,7 @@ def loop(
 
         _append_metrics_to_json(metrics_path, out_entry)
         print(f"Appended metrics for loop {loop_idx} to {metrics_path}")
-    
+
     if remove_checkpoint:
         shutil.rmtree(checkpoints_path)
 

@@ -8,12 +8,15 @@ Run with:
 
 ```bash
 python eval_loop.py \
-  --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
-  --dataset data/<dataset_name>/train.parquet \
-  --output ./eval/<dataset_name> \
+  --model openai/gpt-oss-120b \
+  --dataset arxiv_math \
+  --output $SCRATCH/rsa_evals/arxiv_math \
   --loops 10 \
   --k 4 \
-  --population 16
+  --population 16 \
+  --tp-size 4 \
+  --reasoning "high" \
+  --summarize-cot
 ```
 
 Replace `<dataset_name>` with one of:
