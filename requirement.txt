@@ -1,0 +1,16 @@
+loguru
+vllm
+regex
+sympy
+openai_harmony
+reasoning_gym
+pandas
+transformers
+datasets
+tqdm
+math_verify
+hydra-core
+omegaconf
+kimina-client
+openai
+antlr4-python3-runtime==4.11.1
